@@ -1,0 +1,160 @@
+on: [push, pull_request]
+
+name: Continuous integration
+
+jobs:
+  # Lints are going first, since it is cheap to run them
+  # and we want to fail as fast as possible
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macOS-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: clippy
+      - run: cargo clippy --all-targets --workspace -- -D warnings
+
+  # Now, let's check that code compiles at least
+  compile:
+    name: ${{ matrix.toolchain }} / ${{ matrix.triple.target }}
+    needs: [rustfmt, clippy]
+    runs-on: ${{ matrix.triple.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          # Tier 1 platforms
+          - { os: 'ubuntu-latest',  target: 'x86_64-unknown-linux-gnu', cross: false }
+          - { os: 'ubuntu-latest',  target: 'i686-unknown-linux-gnu',   cross: true }
+          - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
+          # TODO: cross does not support it
+          # - { os: 'windows-latest', target: 'i686-pc-windows-msvc',     cross: true }
+          - { os: 'windows-latest', target: 'x86_64-pc-windows-msvc',   cross: false }
+
+          # Tier 2 platforms
+
+          ## ARM64
+          - { os: 'ubuntu-latest', target: 'aarch64-unknown-linux-gnu',  cross: true }
+          - { os: 'ubuntu-latest', target: 'aarch64-unknown-linux-musl', cross: true }
+          ## ARMv7
+          - { os: 'ubuntu-latest', target: 'armv7-unknown-linux-gnueabihf',  cross: true }
+          - { os: 'ubuntu-latest', target: 'armv7-unknown-linux-musleabihf', cross: true }
+          ## ARMv6
+          - { os: 'ubuntu-latest', target: 'arm-unknown-linux-gnueabihf',  cross: true }
+          - { os: 'ubuntu-latest', target: 'arm-unknown-linux-musleabihf', cross: true }
+        toolchain:
+          - 1.46.0  # MSRV
+          - stable
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+
+      - name: Check
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --features full --target=${{ matrix.triple.target }} --manifest-path=heim/Cargo.toml
+          use-cross: ${{ matrix.triple.cross }}
+
+  # Test suite is executed for Tier 1 platforms now,
+  # which mean we can do that natively on the Actions VMs
+  tests:
+    needs: [compile]
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Having some test issues with Windows and `proc_macro_hack` crate,
+    # allowing to fail for a while
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macOS-latest
+          - windows-latest
+        # We need nightly for `-Zprofile`
+        toolchain:
+          - nightly
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+
+      - name: Execute tests (not macOS)
+        if: startsWith(matrix.os, 'macOS') == false
+        run: cargo test --no-fail-fast
+        env:
+          RUST_BACKTRACE: full
+          CARGO_INCREMENTAL: 0
+          RUSTDOCFLAGS: "-Cpanic=abort"
+          RUSTFLAGS: "-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off"
+
+      - name: Execute tests (macOS)
+        if: startsWith(matrix.os, 'macOS') == true
+        run: cargo test --no-fail-fast
+        env:
+          RUST_BACKTRACE: full
+          CARGO_INCREMENTAL: 0
+          RUSTDOCFLAGS: "-Cpanic=abort"
+          RUSTFLAGS: "-Zprofile -Ccodegen-units=1 -Copt-level=0 -Coverflow-checks=off"
+
+      - name: Install grcov
+        uses: actions-rs/install@v0.1
+        with:
+          crate: grcov
+
+      - name: Gather coverage data
+        id: coverage
+        uses: actions-rs/grcov@v0.1
+        with:
+          coveralls-token: ${{ secrets.COVERALLS_TOKEN }}
+
+      - name: Coveralls upload
+        uses: coverallsapp/github-action@master
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parallel: true
+          path-to-lcov: ${{ steps.coverage.outputs.report }}
+
+  code_coverage_finalize:
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Coveralls finalization
+        uses: coverallsapp/github-action@master
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parallel-finished: true
